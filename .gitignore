@@ -1,0 +1,49 @@
+# Data: ignore everything except the finished dataset
+data/*
+!data/final/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local config
+.env
+*.key
+
+# Logs
+*.log
+
+# Training outputs (LoRA adapters, checkpoints, merged models)
+checkpoints/
+adapters/
+merged/
+outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Experiment tracking
+wandb/
+mlruns/
+runs/
+tensorboard/
+
+# Hugging Face / local caches
+.cache/
+hf_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
