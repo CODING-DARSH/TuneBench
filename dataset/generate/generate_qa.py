@@ -1,11 +1,14 @@
-"""Generate question/answer candidates from cleaned chunks with Groq and Gemini.
+"""Generate question/answer candidates from cleaned chunks with Groq (and Gemini).
 
 - Both providers use the OpenAI-compatible chat endpoint (plain `requests`).
 - Keys and model names come from .env (see .env.example).
+- Several keys per provider are supported (GROQ_API_KEY_1, GROQ_API_KEY_2, ...).
+  Each key is its own account: it has its own wait timer and its own daily limit,
+  and the script rotates across all keys that are still available.
+- Only providers listed in PROVIDERS_ENABLED are used (default: groq).
 - Resumable: finished chunks are recorded by a hash of their content (not their
   position), so you can stop it anywhere, even with Ctrl+C or a crash, and rerun.
-- Rotates between providers; a provider that hits its daily limit is dropped
-  for the rest of the run. When all providers are exhausted, it saves and exits.
+- When every key is exhausted, it saves and exits; rerun later to continue.
 
 Input:  data/chunks_clean.jsonl
 Output: data/candidates_raw.jsonl        (one Q&A per line, with provenance)
@@ -31,12 +34,12 @@ MAX_SERVER_STRIKES = 6    # drop a provider for the run after this many server e
 PROVIDERS = {
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "key_env": "GROQ_API_KEY", "model_env": "GROQ_MODEL",
+        "key_env": "GROQ_API_KEY", "model_env": "GROQ_MODEL",  # keys: GROQ_API_KEY_1, _2, ...
         "gap_env": "GROQ_SECONDS_BETWEEN_CALLS", "gap_default": 13,
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "key_env": "GEMINI_API_KEY", "model_env": "GEMINI_MODEL",
+        "key_env": "GEMINI_API_KEY", "model_env": "GEMINI_MODEL",  # keys: GEMINI_API_KEY_1, _2, ...
         "gap_env": "GEMINI_SECONDS_BETWEEN_CALLS", "gap_default": 7,
     },
 }
@@ -86,6 +89,28 @@ def load_env():
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def load_accounts():
+    """One account per API key of every enabled provider: {"groq#1": {...}, ...}."""
+    enabled = [x.strip() for x in os.environ.get("PROVIDERS_ENABLED", "groq").split(",") if x.strip()]
+    accounts = {}
+    for prov in enabled:
+        p = PROVIDERS.get(prov)
+        if p is None:
+            sys.exit(f"unknown provider '{prov}' in PROVIDERS_ENABLED (use: {', '.join(PROVIDERS)})")
+        if not os.environ.get(p["model_env"]):
+            print(f"{prov}: {p['model_env']} is not set in .env, skipping")
+            continue
+        pat = re.compile(rf"^{re.escape(p['key_env'])}(?:_(\d+))?$")
+        found = sorted((int(m.group(1) or 0), v.strip()) for k, v in os.environ.items()
+                       if (m := pat.match(k)) and v.strip())
+        keys = list(dict.fromkeys(v for _, v in found))  # drop duplicate key values
+        for i, key in enumerate(keys, 1):
+            accounts[f"{prov}#{i}"] = {
+                "provider": prov, "key": key, "ready_at": 0.0, "disabled": None, "strikes": 0,
+                "gap": float(os.environ.get(p["gap_env"], p["gap_default"]))}
+    return accounts
 
 
 def chunk_key(c):
@@ -185,10 +210,9 @@ def parse_response(text):
     return out
 
 
-def call_api(name, prompt):
-    p = PROVIDERS[name]
-    headers = {"Authorization": f"Bearer {os.environ[p['key_env']]}",
-               "Content-Type": "application/json"}
+def call_api(provider, key, prompt):
+    p = PROVIDERS[provider]
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     # generous limit: thinking models spend part of it on hidden reasoning
     body = {"model": os.environ[p["model_env"]], "temperature": 0.3, "max_tokens": 4000,
             "messages": [{"role": "system", "content": SYSTEM},
@@ -219,13 +243,18 @@ def is_server_error(res):
     return res["code"] in (0, 200) or res["code"] >= 500
 
 
-def handle_failure(name, state, res):
+def handle_failure(label, state, res):
     code, body, now = res["code"], res["body"].lower(), time.time()
-    s = state[name]
+    s = state[label]
     if code in (401, 403):
-        s["disabled"] = f"auth error ({code}): check the API key"
+        s["disabled"] = f"auth error ({code}): check this API key"
     elif code == 404 or (code == 400 and "model" in body):
-        s["disabled"] = "model not found: check the model name in .env"
+        # the model name is shared by all keys of a provider, so none of them can work
+        for a in state.values():
+            if a["provider"] == s["provider"]:
+                a["disabled"] = "model not found: check the model name in .env"
+        print(f"  [{label}] model not found: all {s['provider']} keys disabled for this run")
+        return
     elif code == 429:
         ra = res.get("retry_after")
         m = re.search(r'"retrydelay":\s*"(\d+(?:\.\d+)?)s"', body)  # Gemini's suggested wait
@@ -249,35 +278,38 @@ def handle_failure(name, state, res):
         s["ready_at"] = now + (res.get("retry_after") or 10)
     short = " ".join(res["body"].split())[:90]
     if s["disabled"]:
-        print(f"  [{name}] disabled for this run: {s['disabled']}")
+        print(f"  [{label}] disabled for this run: {s['disabled']}")
     else:
         wait = max(0, int(s["ready_at"] - now))
-        print(f"  [{name}] HTTP {code}, waiting {wait}s before using it again: {short}")
+        print(f"  [{label}] HTTP {code}, waiting {wait}s before using it again: {short}")
 
 
-def pick_provider(state):
+def pick_account(state):
+    """The available key that has waited longest; sleeps until it is ready."""
     active = [n for n, s in state.items() if not s["disabled"]]
     if not active:
         return None
-    name = min(active, key=lambda n: state[n]["ready_at"])
-    wait = state[name]["ready_at"] - time.time()
+    label = min(active, key=lambda n: state[n]["ready_at"])
+    wait = state[label]["ready_at"] - time.time()
     if wait > 0:
         time.sleep(wait)
-    return name
+    return label
 
 
-def process_chunk(chunk, key, state, out, prog, stats, label):
-    """Call providers until the chunk is finished or must be skipped.
-    Returns False if every provider is exhausted."""
+def process_chunk(chunk, key, state, out, prog, stats, tag):
+    """Call API keys until the chunk is finished or must be skipped.
+    Returns False if every key is exhausted."""
     prompt, failures = build_prompt(chunk), 0
     while True:
-        name = pick_provider(state)
-        if name is None:
+        label = pick_account(state)
+        if label is None:
             return False
-        res = call_api(name, prompt)
-        state[name]["ready_at"] = time.time() + state[name]["gap"]
+        acct = state[label]
+        provider = acct["provider"]
+        res = call_api(provider, acct["key"], prompt)
+        acct["ready_at"] = time.time() + acct["gap"]
         if res["ok"]:
-            state[name]["strikes"] = 0
+            acct["strikes"] = 0
             items = parse_response(res["text"])
             status = "bad_json" if items is None else ("empty" if not items else "ok")
             lines = []
@@ -288,27 +320,27 @@ def process_chunk(chunk, key, state, out, prog, stats, label):
                        "source_title": chunk.get("source_title"),
                        "heading_path": chunk.get("heading_path"),
                        "license": chunk.get("license"), "tier": chunk.get("tier"),
-                       "cues": chunk.get("cues"), "method": "llm", "provider": name,
-                       "model": os.environ[PROVIDERS[name]["model_env"]]}
+                       "cues": chunk.get("cues"), "method": "llm", "provider": provider,
+                       "model": os.environ[PROVIDERS[provider]["model_env"]]}
                 lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
             # one write per chunk: Q&A first, then the progress line
             if lines:
                 out.write("".join(lines))
                 out.flush()
             prog.write(json.dumps({"chunk_key": key, "chunk_id": chunk["id"], "status": status,
-                                   "provider": name, "n": len(lines)}) + "\n")
+                                   "provider": provider, "n": len(lines)}) + "\n")
             prog.flush()
             stats[status] += 1
             stats["qa"] += len(lines)
-            stats["by_" + name] += 1
-            print(f"{label} {chunk['id']} {name} -> {status} ({len(lines)})")
+            stats["by_" + label] += 1
+            print(f"{tag} {chunk['id']} {label} -> {status} ({len(lines)})")
             return True
-        handle_failure(name, state, res)
+        handle_failure(label, state, res)
         if not is_server_error(res):
             failures += 1
         if failures >= MAX_FAILURES:
             stats["skipped"] += 1
-            print(f"{label} {chunk['id']} skipped after {failures} failures (will retry next run)")
+            print(f"{tag} {chunk['id']} skipped after {failures} failures (will retry next run)")
             return True
 
 
@@ -333,14 +365,12 @@ def main(argv=None):
             print("\n--- first prompt ---\n" + build_prompt(queue[0]))
         return
 
-    state = {}
-    for name, p in PROVIDERS.items():
-        if os.environ.get(p["key_env"]) and os.environ.get(p["model_env"]):
-            state[name] = {"ready_at": 0.0, "disabled": None, "strikes": 0,
-                           "gap": float(os.environ.get(p["gap_env"], p["gap_default"]))}
+    state = load_accounts()
     if not state:
-        sys.exit("no provider configured: copy .env.example to .env and add a key and model name")
-    print("providers:", ", ".join(state), f"| already done (skipped): {len(done)} | chunks to run: {len(queue)}")
+        sys.exit("no API keys found: copy .env.example to .env, add keys and a model name")
+    per_provider = collections.Counter(a["provider"] for a in state.values())
+    print("keys:", ", ".join(f"{p} x{n}" for p, n in per_provider.items()),
+          f"| already done (skipped): {len(done)} | chunks to run: {len(queue)}")
 
     stats = collections.Counter()
     DATA.mkdir(exist_ok=True)
@@ -350,17 +380,17 @@ def main(argv=None):
         with open(OUT_FILE, "a", encoding="utf-8") as out, \
                 open(PROGRESS_FILE, "a", encoding="utf-8") as prog:
             for i, chunk in enumerate(queue, 1):
-                label = f"[{i}/{len(queue)}]"
-                if not process_chunk(chunk, chunk_key(chunk), state, out, prog, stats, label):
-                    print("\nAll providers are exhausted. Progress is saved; rerun later to continue.")
+                tag = f"[{i}/{len(queue)}]"
+                if not process_chunk(chunk, chunk_key(chunk), state, out, prog, stats, tag):
+                    print("\nAll API keys are exhausted. Progress is saved; rerun later to continue.")
                     break
     except KeyboardInterrupt:
         print("\nStopped. Everything finished so far is saved; rerun to continue.")
 
     print("\nsummary:", dict(stats))
-    for n, s in state.items():
-        if s["disabled"]:
-            print(f"  {n}: {s['disabled']}")
+    for label, a in state.items():
+        if a["disabled"]:
+            print(f"  {label}: {a['disabled']}")
 
 
 if __name__ == "__main__":
